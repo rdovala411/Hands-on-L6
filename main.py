@@ -14,7 +14,7 @@ OUTPUT_DIR = "output"
 # Night-listening thresholds (for Task 4)
 NIGHT_HOUR_START = 0      # 12 AM inclusive
 NIGHT_HOUR_END = 4        # 4:59 AM inclusive (0-4)
-NIGHT_PLAY_COUNT_THRESHOLD = 1      # Option A: absolute minimum night plays
+NIGHT_PLAY_COUNT_THRESHOLD = 10      # Option A: absolute minimum night plays
 NIGHT_PLAY_PROPORTION_THRESHOLD = 0.20  # Option B: fraction of total plays in night window
 
 # ===== Spark session =====

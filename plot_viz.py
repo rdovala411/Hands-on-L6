@@ -1,21 +1,17 @@
 #!/usr/bin/env python3
 """
-plot_viz.py
+plot_viz.py (improved)
 
 Usage (defaults assume your structure):
   python plot_viz.py
   python plot_viz.py --root . --out plots --top-n 25
 
-This script auto-detects:
-  listening_logs.csv (root)
-  output/user_favorite_genres/
-  output/avg_listen_time_per_song/
-  output/genre_loyalty_scores/
-  output/night_owl_users/
-
-Produces PNGs in the output directory.
+Changes vs original:
+ - More robust loading of loyalty CSV (searches several likely places).
+ - If loyalty CSV missing but listening logs + user_favorite_genres exist,
+   compute loyalty_score on-the-fly and plot.
+ - Extra logging for diagnostics.
 """
-
 import os
 import argparse
 import glob
@@ -23,6 +19,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 NIGHT_HOURS = set(range(0, 5))  # 0-4 inclusive
+
 
 def read_csv_or_dir(path, **kwargs):
     """Read either a single CSV file or a directory containing CSVs (Spark part-*.csv)."""
@@ -52,6 +49,7 @@ def read_csv_or_dir(path, **kwargs):
     else:
         return None
 
+
 def compute_night_counts_from_logs(df):
     df = df.copy()
     df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
@@ -69,6 +67,7 @@ def compute_night_counts_from_logs(df):
     merged['night_play_proportion'] = merged['night_play_proportion'].fillna(0.0)
     return merged, df
 
+
 def plot_hour_histogram(df_logs, outdir):
     df = df_logs.copy()
     df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
@@ -77,7 +76,7 @@ def plot_hour_histogram(df_logs, outdir):
     counts = df['hour'].value_counts().sort_index()
     all_hours = pd.Series(0, index=range(24))
     counts = all_hours.add(counts, fill_value=0).astype(int)
-    plt.figure(figsize=(10,5))
+    plt.figure(figsize=(10, 5))
     plt.bar(counts.index, counts.values)
     plt.xlabel('Hour of day (0-23)')
     plt.ylabel('Number of listens')
@@ -89,9 +88,10 @@ def plot_hour_histogram(df_logs, outdir):
     plt.close()
     print(f"Wrote {path}")
 
+
 def plot_night_count_histogram(df_night, outdir):
-    plt.figure(figsize=(8,5))
-    maxbin = max(15, df_night['night_play_count'].max()+2)
+    plt.figure(figsize=(8, 5))
+    maxbin = max(15, int(df_night['night_play_count'].max() if not df_night.empty else 0) + 2)
     plt.hist(df_night['night_play_count'], bins=range(0, maxbin), edgecolor='black')
     plt.xlabel('Night play count (hours 0-4)')
     plt.ylabel('Number of users')
@@ -102,12 +102,13 @@ def plot_night_count_histogram(df_night, outdir):
     plt.close()
     print(f"Wrote {path}")
 
+
 def plot_top_night_owls(df_night, outdir, top_n=20):
     top = df_night.sort_values('night_play_count', ascending=False).head(top_n)
     if top.empty:
         print("No night owl data to plot for top users.")
         return
-    plt.figure(figsize=(10, max(4, top_n*0.3)))
+    plt.figure(figsize=(10, max(4, top_n * 0.3)))
     plt.barh(top['user_id'].astype(str), top['night_play_count'])
     plt.gca().invert_yaxis()
     plt.xlabel('Night play count (0-4h)')
@@ -118,25 +119,28 @@ def plot_top_night_owls(df_night, outdir, top_n=20):
     plt.close()
     print(f"Wrote {path}")
 
+
 def plot_loyalty_vs_night(loyalty_df, night_df, outdir):
     if loyalty_df is None:
         print("No loyalty dataframe provided; skipping loyalty plot.")
         return
-    # normalize column names
     df = loyalty_df.copy()
     if 'user_id' not in df.columns:
         print("Loyalty file missing user_id column; skipping loyalty plot.")
         return
+
     if 'loyalty_score' not in df.columns:
-        # attempt to infer from columns: maybe 'loyalty' or similar
+        # attempt to infer a candidate column (contains 'loyal' or 'score')
         candidates = [c for c in df.columns if 'loyal' in c.lower() or 'score' in c.lower()]
         if candidates:
             df = df.rename(columns={candidates[0]: 'loyalty_score'})
+            print(f"Renamed column '{candidates[0]}' -> 'loyalty_score' for plotting.")
         else:
             print("Loyalty file missing loyalty_score column; skipping loyalty plot.")
             return
+
     merged = df.merge(night_df[['user_id', 'night_play_proportion']], on='user_id', how='left').fillna(0)
-    plt.figure(figsize=(8,6))
+    plt.figure(figsize=(8, 6))
     plt.scatter(merged['loyalty_score'], merged['night_play_proportion'], s=20)
     plt.xlabel('Loyalty score (top genre fraction)')
     plt.ylabel('Night play proportion (0-1)')
@@ -147,9 +151,93 @@ def plot_loyalty_vs_night(loyalty_df, night_df, outdir):
     plt.close()
     print(f"Wrote {path}")
 
+
 def ensure_outdir(path):
     os.makedirs(path, exist_ok=True)
     return path
+
+
+def try_find_loyalty_path(output_root):
+    """
+    Try several likely places for loyalty / genre_loyalty_scores outputs.
+    Returns path (dir) or None.
+    """
+    candidates = [
+        os.path.join(output_root, 'genre_loyalty_scores'),
+        os.path.join(output_root, 'genre_loyalty_scores_all'),
+        os.path.join(output_root, 'genre_loyalty_scores_above_0_8'),
+        os.path.join(output_root, 'genre_loyalty_scores_part'),
+    ]
+    # add any folder under output_root containing 'loyal' or 'genre_loyalty'
+    for entry in os.listdir(output_root) if os.path.isdir(output_root) else []:
+        if 'loyal' in entry.lower() or 'genre_loyal' in entry.lower():
+            candidates.append(os.path.join(output_root, entry))
+
+    # also look through entire tree for any directory or file name that contains 'loyal'
+    for p in glob.glob(os.path.join(output_root, '**', '*loyal*.csv'), recursive=True):
+        candidates.append(os.path.dirname(p))
+
+    # choose first candidate that exists and has CSVs
+    for c in candidates:
+        if c and os.path.isdir(c):
+            try:
+                files = list(glob.glob(os.path.join(c, "*.csv"))) + list(glob.glob(os.path.join(c, "part-*.csv")))
+                if files:
+                    print(f"Found loyalty candidate: {c} (files: {len(files)})")
+                    return c
+            except Exception:
+                continue
+    return None
+
+
+def compute_loyalty_from_logs_and_user_fav(logs_df, user_fav_dir):
+    """
+    If loyalty CSV is not available, compute loyalty using:
+     - user_fav_dir: Spark output with (user_id, genre, plays) produced by Task 1
+     - logs_df: raw listening logs with timestamps
+    Returns a dataframe with user_id, top_genre, top_genre_plays, total_plays, loyalty_score
+    """
+    if logs_df is None:
+        print("No raw logs available to compute loyalty.")
+        return None
+    if not os.path.isdir(user_fav_dir):
+        print("user_favorite_genres output not present; cannot compute loyalty from logs.")
+        return None
+
+    try:
+        user_fav = read_csv_or_dir(user_fav_dir)
+    except Exception as e:
+        print(f"Failed to load user_favorite_genres from {user_fav_dir}: {e}")
+        return None
+
+    # Expect user_fav to have columns: user_id, genre, plays (or similar)
+    fav = user_fav.copy()
+    # normalize names
+    if 'user_id' not in fav.columns:
+        possible = [c for c in fav.columns if 'user' in c.lower()]
+        if possible:
+            fav = fav.rename(columns={possible[0]: 'user_id'})
+    if 'plays' not in fav.columns:
+        possible = [c for c in fav.columns if 'play' in c.lower() or 'count' in c.lower()]
+        if possible:
+            fav = fav.rename(columns={possible[0]: 'plays'})
+
+    if 'user_id' not in fav.columns or 'plays' not in fav.columns:
+        print("user_favorite_genres file missing expected columns; cannot compute loyalty.")
+        return None
+
+    # compute total plays per user from logs_df
+    totals = logs_df.groupby('user_id').size().reset_index(name='total_plays')
+    merged = fav.merge(totals, on='user_id', how='left').fillna(0)
+    merged['top_genre_plays'] = merged['plays'].astype(int)
+    merged['total_plays'] = merged['total_plays'].astype(int)
+    merged['loyalty_score'] = merged['top_genre_plays'] / merged['total_plays'].replace(0, pd.NA)
+    merged['loyalty_score'] = merged['loyalty_score'].fillna(0.0)
+    # keep only useful cols
+    out = merged[['user_id', 'genre', 'top_genre_plays', 'total_plays', 'loyalty_score']].rename(columns={'genre': 'top_genre'})
+    print(f"Computed loyalty for {len(out)} users from raw logs + user_favorite_genres.")
+    return out
+
 
 def main():
     p = argparse.ArgumentParser()
@@ -165,13 +253,12 @@ def main():
     listening_path = os.path.join(root, 'listening_logs.csv')
     out_dir = os.path.join(root, 'output')
     spark_user_fav = os.path.join(out_dir, 'user_favorite_genres')
-    spark_avg_listen = os.path.join(out_dir, 'avg_listen_time_per_song')
-    spark_loyalty = os.path.join(out_dir, 'genre_loyalty_scores')
+    spark_loyalty = None  # will search
     spark_night = os.path.join(out_dir, 'night_owl_users')
 
     print("Looking for files:")
     print(f" - listening_logs.csv: {listening_path}")
-    print(f" - output dir: {out_dir} (user_favorite_genres, avg_listen_time_per_song, genre_loyalty_scores, night_owl_users)")
+    print(f" - output dir: {out_dir}")
 
     logs_df = None
     if os.path.exists(listening_path):
@@ -180,78 +267,72 @@ def main():
     else:
         print("No listening_logs.csv found in root.")
 
-    # Try to read spark night counts if no raw logs
+    # load or compute night_df
     night_df = None
-    if os.path.isdir(spark_night):
-        print(f"Loading night counts from {spark_night}")
-        try:
-            night_df = read_csv_or_dir(spark_night)
-            # normalize column names
-            if 'night_play_count' not in night_df.columns:
-                for c in ['night_play_count', 'night_count', 'night_plays', 'count']:
-                    if c in night_df.columns:
-                        night_df = night_df.rename(columns={c: 'night_play_count'})
-                        break
-            if 'user_id' not in night_df.columns:
-                # maybe saved as user_id column missing? give warning
-                print("Warning: night_owl_users CSV doesn't contain 'user_id' column.")
-        except Exception as e:
-            print(f"Failed to read night_owl_users: {e}")
-            night_df = None
+    if logs_df is not None:
+        print("Computing night counts from raw logs.")
+        night_df, logs_df = compute_night_counts_from_logs(logs_df)
+    else:
+        # try reading Spark night output (if no raw logs)
+        if os.path.isdir(spark_night):
+            try:
+                print(f"Loading night counts from {spark_night}")
+                night_df = read_csv_or_dir(spark_night)
+                # normalize column names:
+                if 'night_play_count' not in night_df.columns:
+                    for c in ['night_play_count', 'night_count', 'night_plays', 'count']:
+                        if c in night_df.columns:
+                            night_df = night_df.rename(columns={c: 'night_play_count'})
+                            break
+                if 'user_id' not in night_df.columns:
+                    print("Warning: night_owl_users output missing 'user_id'.")
+                # compute proportion if total present
+                if 'night_play_proportion' not in night_df.columns and 'total_play_count' in night_df.columns:
+                    night_df['night_play_proportion'] = night_df['night_play_count'] / night_df['total_play_count'].replace(0, pd.NA)
+                    night_df['night_play_proportion'] = night_df['night_play_proportion'].fillna(0.0)
+            except Exception as e:
+                print("Failed to read night_owl_users:", e)
+        else:
+            print("No night data available (no logs and no spark night_owl_users).")
 
-    # Try to read loyalty file (genre_loyalty_scores)
+    # locate loyalty output (search common names)
+    if os.path.isdir(out_dir):
+        found = try_find_loyalty_path(out_dir)
+        if found:
+            spark_loyalty = found
+
     loyalty_df = None
-    if os.path.isdir(spark_loyalty):
+    if spark_loyalty:
         try:
-            print(f"Loading loyalty/genre scores from {spark_loyalty}")
+            print(f"Loading loyalty CSVs from {spark_loyalty}")
             loyalty_df = read_csv_or_dir(spark_loyalty)
         except Exception as e:
-            print(f"Failed to read loyalty csv: {e}")
+            print("Failed to read loyalty csv:", e)
             loyalty_df = None
+    else:
+        print("No loyalty output directory detected under output/. Will attempt to compute loyalty from logs + user_favorite_genres if possible.")
 
-    # If we have logs, compute night_df (preferred)
-    if logs_df is not None:
-        print("Computing night counts and hour histogram from raw logs.")
-        night_df, logs_df = compute_night_counts_from_logs(logs_df)
+    # If loyalty_df is still None, try to compute it from logs + user_favorite_genres
+    if loyalty_df is None:
+        print("Attempting to compute loyalty score from raw logs and user_favorite_genres output...")
+        computed = compute_loyalty_from_logs_and_user_fav(logs_df, spark_user_fav)
+        if computed is not None:
+            loyalty_df = computed
+        else:
+            print("Could not compute loyalty_df from available inputs.")
 
-    # If we still don't have night_df but have spark_night, try to normalize it (and compute proportion if total provided)
-    if night_df is None and os.path.isdir(spark_night):
-        print("Attempting to normalize spark night_owl_users output.")
-        try:
-            # ensure columns
-            if 'user_id' in night_df.columns and 'night_play_count' in night_df.columns:
-                night_df['night_play_proportion'] = night_df.get('night_play_proportion', 0.0)
-            else:
-                # attempt to load again robustly
-                tmp = read_csv_or_dir(spark_night)
-                if 'night_play_count' not in tmp.columns:
-                    for c in ['night_play_count', 'night_count', 'night_plays', 'count']:
-                        if c in tmp.columns:
-                            tmp = tmp.rename(columns={c: 'night_play_count'})
-                            break
-                if 'total_play_count' in tmp.columns and 'night_play_count' in tmp.columns:
-                    tmp['night_play_proportion'] = tmp['night_play_count'] / tmp['total_play_count'].replace(0, pd.NA)
-                    tmp['night_play_proportion'] = tmp['night_play_proportion'].fillna(0.0)
-                else:
-                    tmp['night_play_proportion'] = tmp.get('night_play_proportion', 0.0)
-                night_df = tmp
-        except Exception as ee:
-            print("Could not normalize spark night output:", ee)
-
-    # Now create plots
+    # Now produce plots
     if logs_df is not None:
         plot_hour_histogram(logs_df, outdir)
     else:
         print("Skipping hour histogram (no listening_logs.csv).")
 
     if night_df is not None:
-        # ensure integer type
+        # ensure numeric types
         if 'night_play_count' in night_df.columns:
             night_df['night_play_count'] = pd.to_numeric(night_df['night_play_count'], errors='coerce').fillna(0).astype(int)
         else:
-            print("Night dataframe missing night_play_count; creating zero column.")
             night_df['night_play_count'] = 0
-        # compute proportion if missing (need total_play_count)
         if 'night_play_proportion' not in night_df.columns:
             if 'total_play_count' in night_df.columns:
                 night_df['night_play_proportion'] = night_df['night_play_count'] / night_df['total_play_count'].replace(0, pd.NA)
@@ -266,11 +347,23 @@ def main():
 
     # loyalty scatter
     if loyalty_df is not None:
-        plot_loyalty_vs_night(loyalty_df, night_df if night_df is not None else pd.DataFrame(columns=['user_id','night_play_proportion']), outdir)
+        # If loyalty_df has different column names make it compatible
+        if 'user_id' in loyalty_df.columns and 'loyalty_score' not in loyalty_df.columns:
+            # attempt to find a probable column
+            candidates = [c for c in loyalty_df.columns if 'loyal' in c.lower() or 'score' in c.lower()]
+            if candidates:
+                loyalty_df = loyalty_df.rename(columns={candidates[0]: 'loyalty_score'})
+                print(f"Renamed column {candidates[0]} -> loyalty_score in loyalty_df")
+        # ensure we have user_id and loyalty_score
+        if 'user_id' in loyalty_df.columns and 'loyalty_score' in loyalty_df.columns:
+            plot_loyalty_vs_night(loyalty_df, night_df if night_df is not None else pd.DataFrame(columns=['user_id', 'night_play_proportion']), outdir)
+        else:
+            print("Loyalty data present but missing required columns; skipping loyalty plot.")
     else:
-        print("No loyalty/genre file found under output/genre_loyalty_scores; skipping loyalty plot.")
+        print("No loyalty/genre file found and could not compute it; skipping loyalty plot.")
 
     print("Done. Plots saved to:", outdir)
+
 
 if __name__ == "__main__":
     main()
